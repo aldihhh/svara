@@ -1,0 +1,150 @@
+name: Build Svara APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      with_ext:
+        description: "Sertakan modul Svara (Notifikasi, login Google, push)? Pilih false untuk build polos (uji penyebab crash)."
+        type: choice
+        default: "true"
+        options: ["true", "false"]
+
+permissions:
+  contents: write
+
+env:
+  # Opsional: kalau tidak diisi, build tetap jalan dengan kunci baru
+  KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+  KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+  KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+  # Wajib: koneksi ke server Svara & login Google
+  SVARA_APP_KEY: ${{ secrets.SVARA_APP_KEY }}
+  SVARA_WEB_CLIENT_ID: ${{ secrets.SVARA_WEB_CLIENT_ID }}
+  # Opsional (default https://svara.aldih.com)
+  SVARA_BASE_URL: ${{ secrets.SVARA_BASE_URL }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Setup Gradle
+        if: ${{ github.event.inputs.with_ext != 'false' }}
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Isi konfigurasi modul Svara (dari Secrets + google-services.json)
+        if: ${{ github.event.inputs.with_ext != 'false' }}
+        run: python3 tools/gen_config.py
+
+      - name: Build modul Svara (Notifikasi, login Google, push Firebase)
+        if: ${{ github.event.inputs.with_ext != 'false' }}
+        run: |
+          cd ext
+          gradle :app:assembleRelease --no-daemon --stacktrace
+          cd ..
+          EXT_APK="$(ls ext/app/build/outputs/apk/release/*.apk | head -1)"
+          EXT_MANIFEST="$(find ext/app/build/intermediates -path '*merged_manifest*' -name AndroidManifest.xml | grep -i release | head -1)"
+          echo "Modul APK: $EXT_APK"; echo "Manifest: $EXT_MANIFEST"
+          [ -f "$EXT_APK" ] && [ -f "$EXT_MANIFEST" ] || { echo "::error::Hasil build modul tidak ditemukan"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/extchk" && cd "$RUNNER_TEMP/extchk" && unzip -oq "$GITHUB_WORKSPACE/$EXT_APK" 'classes*.dex'
+          grep -l "com/svara/ext/Hook" classes*.dex >/dev/null || { echo "::error::Kelas Hook tidak ada di dex modul"; exit 1; }
+          echo "EXT_APK=$GITHUB_WORKSPACE/$EXT_APK" >> "$GITHUB_ENV"
+          echo "EXT_MANIFEST=$GITHUB_WORKSPACE/$EXT_MANIFEST" >> "$GITHUB_ENV"
+
+      - name: Download Apktool (rilis terbaru)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/tools" "$RUNNER_TEMP/out"
+          gh release download --repo iBotPeaches/Apktool --pattern 'apktool_*.jar' --dir "$RUNNER_TEMP/tools"
+          mv "$RUNNER_TEMP"/tools/apktool_*.jar "$RUNNER_TEMP/tools/apktool.jar"
+          java -jar "$RUNNER_TEMP/tools/apktool.jar" --version
+
+      - name: Bongkar APK asli (apktool d)
+        run: |
+          APK="$(ls apk/*.apk | head -1)"
+          echo "Input: $APK ($(du -h "$APK" | cut -f1))"
+          java -Xmx4g -jar "$RUNNER_TEMP/tools/apktool.jar" d "$APK" -f -o "$RUNNER_TEMP/src"
+
+      - name: Rebrand (nama, package, link, icon, versi)
+        run: |
+          python3 tools/rebrand.py "$RUNNER_TEMP/src" assets "$RUNNER_TEMP/out/rebrand-report.txt"
+
+      - name: Suntik modul Svara (smali + manifest)
+        if: ${{ github.event.inputs.with_ext != 'false' }}
+        run: |
+          python3 tools/patch_svara.py smali "$RUNNER_TEMP/src"
+          python3 tools/patch_svara.py manifest "$RUNNER_TEMP/src" "$EXT_MANIFEST" | tee "$RUNNER_TEMP/out/inject-report.txt"
+
+      - name: Upload laporan rebrand
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rebrand-report
+          path: |
+            ${{ runner.temp }}/out/rebrand-report.txt
+            ${{ runner.temp }}/out/inject-report.txt
+          if-no-files-found: ignore
+
+      - name: Build APK (apktool b)
+        run: |
+          java -Xmx4g -jar "$RUNNER_TEMP/tools/apktool.jar" b "$RUNNER_TEMP/src" -f -o "$RUNNER_TEMP/out/unsigned.apk"
+
+      - name: Tambahkan dex modul Svara ke APK
+        if: ${{ github.event.inputs.with_ext != 'false' }}
+        run: python3 tools/patch_svara.py dex "$RUNNER_TEMP/out/unsigned.apk" "$EXT_APK"
+
+      - name: Zipalign dan tanda tangan
+        run: |
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          OUT="$RUNNER_TEMP/out"
+          VER="$(grep -m1 'versionName:' "$RUNNER_TEMP/src/apktool.yml" | awk '{print $2}' | tr -d "'\"")"
+          VER="${VER:-1.1.0}"
+          "$BT/zipalign" -p -f 4 "$OUT/unsigned.apk" "$OUT/aligned.apk"
+
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$OUT/svara.jks"
+            PASS="$KEYSTORE_PASSWORD"; ALIAS="${KEY_ALIAS:-svara}"
+          else
+            echo "::warning::KEYSTORE_BASE64 belum diisi, memakai kunci baru. APK antar-build tidak bisa saling update (harus uninstall dulu)."
+            PASS="$(openssl rand -hex 12)"; ALIAS="svara"
+            keytool -genkeypair -keystore "$OUT/svara.jks" -storepass "$PASS" -keypass "$PASS" \
+              -alias "$ALIAS" -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Svara, O=Aldih"
+          fi
+
+          "$BT/apksigner" sign --ks "$OUT/svara.jks" --ks-pass "pass:$PASS" --key-pass "pass:$PASS" \
+            --ks-key-alias "$ALIAS" --out "$OUT/Svara-v$VER.apk" "$OUT/aligned.apk"
+          "$BT/apksigner" verify --print-certs "$OUT/Svara-v$VER.apk"
+          { echo "### Sidik jari kunci APK (untuk Google Cloud OAuth Android)"; "$BT/apksigner" verify --print-certs "$OUT/Svara-v$VER.apk" | grep -E "SHA-(1|256) digest" | sed 's/^/- /'; } >> "$GITHUB_STEP_SUMMARY"
+          echo "APK_PATH=$OUT/Svara-v$VER.apk" >> "$GITHUB_ENV"
+          echo "APK_VER=$VER" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Svara-APK
+          path: ${{ env.APK_PATH }}
+          retention-days: 30
+
+      - name: Publish ke Releases (link download langsung, cocok dibuka dari HP)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest -y --cleanup-tag || true
+          gh release create latest "$APK_PATH" --target "$GITHUB_SHA" \
+            --title "Svara v$APK_VER (build terbaru)" \
+            --notes "Build otomatis dari commit $GITHUB_SHA"
