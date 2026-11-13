@@ -1,0 +1,62 @@
+name: Export kode Svara (TANPA build APK)
+
+# Hanya membongkar APK asli + rebrand, lalu menjadikannya file ZIP kode (kecil, <25MB) untuk dikirim ke Claude.
+# TIDAK membangun APK.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Download Apktool
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/tools" "$RUNNER_TEMP/out"
+          gh release download --repo iBotPeaches/Apktool --pattern 'apktool_*.jar' --dir "$RUNNER_TEMP/tools"
+          mv "$RUNNER_TEMP"/tools/apktool_*.jar "$RUNNER_TEMP/tools/apktool.jar"
+      - name: Bongkar APK asli
+        run: |
+          APK="$(ls apk/*.apk | head -1)"
+          java -Xmx4g -jar "$RUNNER_TEMP/tools/apktool.jar" d "$APK" -f -o "$RUNNER_TEMP/src"
+      - name: Rebrand
+        run: python3 tools/rebrand.py "$RUNNER_TEMP/src" assets "$RUNNER_TEMP/out/rebrand-report.txt"
+      - name: Jadikan ZIP kode (tanpa build)
+        run: |
+          S="$RUNNER_TEMP/src"; D="$RUNNER_TEMP/Svara-source"; mkdir -p "$D/res"
+          cp "$S/AndroidManifest.xml" "$S/apktool.yml" "$D/"
+          for d in values values-night values-v31 values-v29 values-v23 values-v21 layout color anim drawable drawable-v31 drawable-anydpi mipmap-anydpi-v31 mipmap-anydpi xml menu; do
+            [ -d "$S/res/$d" ] && cp -r "$S/res/$d" "$D/res/"
+          done
+          find "$D/res" -type f \( -name '*.png' -o -name '*.webp' -o -name '*.ttf' -o -name '*.otf' \) -delete
+          for dir in smali smali_classes2 smali_classes3 smali_classes4; do
+            if [ -d "$S/$dir/com/metrolist/music/ui" ]; then mkdir -p "$D/$dir/com/metrolist/music"; cp -r "$S/$dir/com/metrolist/music/ui" "$D/$dir/com/metrolist/music/"; fi
+          done
+          cp "$RUNNER_TEMP/out/rebrand-report.txt" "$D/" || true
+          cd "$RUNNER_TEMP" && zip -qr out/Svara-source.zip Svara-source
+          ls -la out/Svara-source.zip
+          [ "$(stat -c %s out/Svara-source.zip)" -lt 25000000 ] || echo "::warning::ZIP lebih dari 25MB"
+          echo "ZIP=$RUNNER_TEMP/out/Svara-source.zip" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Svara-source
+          path: ${{ env.ZIP }}
+      - name: Publish ke Releases (unduh dari HP lewat tab Releases)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete source -y --cleanup-tag || true
+          gh release create source "$ZIP" --target "$GITHUB_SHA" --title "Svara-source.zip (kode rebrand, bukan APK)" --notes "Kode hasil rebrand, belum dibuild."
